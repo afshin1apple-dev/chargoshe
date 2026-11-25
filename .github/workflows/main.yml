@@ -14,7 +14,7 @@ concurrency:
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 5
 
     steps:
       - name: Checkout repository
@@ -25,15 +25,8 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-
-      - name: Check Python syntax
-        run: python -m py_compile bot.py
-
-      - name: Start Telegram Bot
-        env:
-          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
-        run: python -u bot.py
+      - name: GitHub Actions Test
+        run: |
+          echo "GITHUB ACTIONS TEST OK"
+          python --version
+          echo "WORKFLOW FINISHED SUCCESSFULLY"
