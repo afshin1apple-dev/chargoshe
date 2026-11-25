@@ -7,7 +7,6 @@ on:
     branches:
       - main
 
-# جلوگیری از اجرای هم‌زمان چند نسخه ربات
 concurrency:
   group: telegram-game-bot
   cancel-in-progress: true
@@ -29,9 +28,12 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Check Python syntax
+        run: python -m py_compile bot.py
+
       - name: Start Telegram Bot
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
-        run: python bot.py
+        run: python -u bot.py
