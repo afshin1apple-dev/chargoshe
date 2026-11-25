@@ -1,3 +1,4 @@
+
 import asyncio
 import html
 import os
@@ -21,6 +22,10 @@ SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").rstrip("/")
 SUPABASE_SECRET_KEY = os.getenv("SUPABASE_SECRET_KEY")
 
 HTTP: httpx.AsyncClient | None = None
+bot: Bot | None = None
+
+dp = Dispatcher()
+
 
 CARDS = {
     "حقیقت": [
@@ -87,15 +92,18 @@ CARDS = {
 }
 
 
+PENALTY = "😈 اگه کارت رو انجام ندی، باید از همه اسپنک بخوری!"
+
+
 def db_headers(prefer: str | None = None) -> dict:
-    # کلیدهای جدید sb_secret_* باید فقط در هدر apikey ارسال شوند؛
-    # این کلیدها JWT نیستند و نباید در Authorization: Bearer قرار بگیرند.
     headers = {
         "apikey": SUPABASE_SECRET_KEY,
         "Content-Type": "application/json",
     }
+
     if prefer:
         headers["Prefer"] = prefer
+
     return headers
 
 
@@ -111,6 +119,7 @@ async def db_request(
         raise RuntimeError("اتصال دیتابیس هنوز آماده نشده است.")
 
     url = f"{SUPABASE_URL}/rest/v1/{table}"
+
     response = await HTTP.request(
         method,
         url,
@@ -120,7 +129,6 @@ async def db_request(
     )
 
     if not response.is_success:
-        # جزئیات فنی در لاگ GitHub ثبت می‌شود؛ به کاربران نمایش داده نمی‌شود.
         print(
             f"Supabase error [{response.status_code}] "
             f"on {method} {table}: {response.text}"
@@ -129,11 +137,16 @@ async def db_request(
 
     if response.content:
         return response.json()
+
     return None
 
 
 def group_only(message: Message) -> bool:
     return message.chat.type in ("group", "supergroup")
+
+
+def safe_name(name: str) -> str:
+    return html.escape(name)
 
 
 async def players(chat_id: int) -> list[dict]:
@@ -145,6 +158,7 @@ async def players(chat_id: int) -> list[dict]:
             "chat_id": f"eq.{chat_id}",
         },
     )
+
     return [
         {
             "id": int(row["user_id"]),
@@ -165,21 +179,46 @@ async def active(chat_id: int) -> bool:
             "limit": "1",
         },
     )
+
     return bool(rows and rows[0]["active"])
 
 
 async def set_active(chat_id: int, value: bool) -> None:
-    await db_request(
-        "POST",
+    # ابتدا رکورد موجود را به‌روزرسانی می‌کنیم.
+    rows = await db_request(
+        "PATCH",
         "games",
-        params={"on_conflict": "chat_id"},
-        payload={"chat_id": chat_id, "active": value},
-        prefer="resolution=merge-duplicates,return=minimal",
+        params={
+            "chat_id": f"eq.{chat_id}",
+        },
+        payload={
+            "active": value,
+        },
+        prefer="return=representation",
     )
 
+    # اگر رکورد وجود نداشت، آن را ایجاد می‌کنیم.
+    if not rows:
+        await db_request(
+            "POST",
+            "games",
+            params={
+                "on_conflict": "chat_id",
+            },
+            payload={
+                "chat_id": chat_id,
+                "active": value,
+            },
+            prefer="resolution=merge-duplicates,return=representation",
+        )
 
-def safe_name(name: str) -> str:
-    return html.escape(name)
+    # نتیجه را از دیتابیس دوباره می‌خوانیم.
+    saved_value = await active(chat_id)
+
+    if saved_value != value:
+        raise RuntimeError(
+            f"Game status was not saved correctly for chat {chat_id}"
+        )
 
 
 def next_keyboard() -> InlineKeyboardMarkup:
@@ -196,6 +235,9 @@ def next_keyboard() -> InlineKeyboardMarkup:
 
 
 async def send_card(chat_id: int) -> None:
+    if bot is None:
+        return
+
     members = await players(chat_id)
 
     if (
@@ -213,9 +255,15 @@ async def send_card(chat_id: int) -> None:
 
     if category == "چالش زوجی":
         team_no = random.choice([1, 2])
-        selected = [p for p in members if p["team"] == team_no]
+
+        selected = [
+            p for p in members
+            if p["team"] == team_no
+        ]
+
         target = "زوج " + str(team_no) + ": " + " و ".join(
-            safe_name(p["name"]) for p in selected
+            safe_name(p["name"])
+            for p in selected
         )
     else:
         selected = random.choice(members)
@@ -226,14 +274,9 @@ async def send_card(chat_id: int) -> None:
         f"🎯 <b>{category}</b>\n"
         f"👤 نوبت: <b>{target}</b>\n\n"
         f"🃏 {html.escape(card)}\n\n"
-        "🩵 اجرای کارت فقط با رضایت افراد است؛ "
-        "هرکس می‌تواند کارت را رد کند.",
+        f"{PENALTY}",
         reply_markup=next_keyboard(),
     )
-
-
-bot: Bot | None = None
-dp = Dispatcher()
 
 
 @dp.message(Command("start"))
@@ -293,6 +336,7 @@ async def join(message: Message):
         return
 
     current_players = await players(chat_id)
+
     if len(current_players) >= 4:
         await message.answer("ظرفیت بازی تکمیل است.")
         return
@@ -367,11 +411,15 @@ async def choose_team(message: Message):
             "chat_id": f"eq.{chat_id}",
             "user_id": f"eq.{user_id}",
         },
-        payload={"team": team_no},
+        payload={
+            "team": team_no,
+        },
         prefer="return=minimal",
     )
 
-    await message.answer(f"تیم {team_no} برایت ثبت شد. ✅")
+    await message.answer(
+        f"تیم {team_no} برایت ثبت شد. ✅"
+    )
 
 
 @dp.message(Command("status"))
@@ -388,6 +436,7 @@ async def status(message: Message):
             for p in members
             if p["team"] == team_no
         ]
+
         lines.append(
             f"تیم {team_no}: " + (", ".join(names) or "—")
         )
@@ -399,9 +448,17 @@ async def status(message: Message):
     ]
 
     if unassigned:
-        lines.append("بدون تیم: " + ", ".join(unassigned))
+        lines.append(
+            "بدون تیم: " + ", ".join(unassigned)
+        )
 
     lines.append(f"تعداد اعضا: {len(members)}/4")
+
+    lines.append(
+        "وضعیت اجرا: " +
+        ("🔥 فعال" if await active(message.chat.id) else "⏹ متوقف")
+    )
+
     await message.answer("\n".join(lines))
 
 
@@ -410,7 +467,8 @@ async def begin(message: Message):
     if not group_only(message):
         return
 
-    members = await players(message.chat.id)
+    chat_id = message.chat.id
+    members = await players(chat_id)
 
     if (
         len(members) != 4
@@ -421,9 +479,19 @@ async def begin(message: Message):
         )
         return
 
-    await set_active(message.chat.id, True)
+    try:
+        await set_active(chat_id, True)
+    except Exception as error:
+        print(f"Could not activate game: {error}")
+        await message.answer(
+            "❌ وضعیت بازی در دیتابیس ثبت نشد. "
+            "لطفاً دوباره تلاش کن."
+        )
+        return
+
     await message.answer("🔥 بازی شروع شد!")
-    await send_card(message.chat.id)
+
+    await send_card(chat_id)
 
 
 @dp.message(Command("next"))
@@ -432,7 +500,9 @@ async def next_command(message: Message):
         return
 
     if not await active(message.chat.id):
-        await message.answer("بازی فعال نیست. اول /begin را بزن.")
+        await message.answer(
+            "بازی فعال نیست. اول /begin را بزن."
+        )
         return
 
     await send_card(message.chat.id)
@@ -444,6 +514,7 @@ async def stop(message: Message):
         return
 
     await set_active(message.chat.id, False)
+
     await message.answer("⏹ بازی متوقف شد.")
 
 
@@ -463,6 +534,7 @@ async def next_button(callback: CallbackQuery):
         return
 
     await callback.answer()
+
     await send_card(chat_id)
 
 
@@ -471,31 +543,50 @@ async def main():
 
     if not TOKEN:
         raise RuntimeError("BOT_TOKEN تنظیم نشده است.")
+
     if not SUPABASE_URL:
         raise RuntimeError("SUPABASE_URL تنظیم نشده است.")
+
     if not SUPABASE_SECRET_KEY:
         raise RuntimeError("SUPABASE_SECRET_KEY تنظیم نشده است.")
 
     bot = Bot(
         TOKEN,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+        default=DefaultBotProperties(
+            parse_mode=ParseMode.HTML
+        ),
     )
-    HTTP = httpx.AsyncClient(timeout=httpx.Timeout(20.0))
+
+    HTTP = httpx.AsyncClient(
+        timeout=httpx.Timeout(20.0)
+    )
 
     try:
-        # بررسی اتصال و دسترسی به جدول‌ها پیش از شروع دریافت پیام‌ها
         await db_request(
             "GET",
             "players",
-            params={"select": "user_id", "limit": "1"},
+            params={
+                "select": "user_id",
+                "limit": "1",
+            },
         )
+
         await db_request(
             "GET",
             "games",
-            params={"select": "chat_id", "limit": "1"},
+            params={
+                "select": "chat_id,active",
+                "limit": "1",
+            },
         )
-        print("Supabase connection OK. Telegram bot is starting.")
+
+        print(
+            "Supabase connection OK. "
+            "Telegram bot is starting."
+        )
+
         await dp.start_polling(bot)
+
     finally:
         await HTTP.aclose()
         await bot.session.close()
