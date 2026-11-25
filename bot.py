@@ -21,9 +21,8 @@ TOKEN = os.getenv("BOT_TOKEN")
 SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").rstrip("/")
 SUPABASE_SECRET_KEY = os.getenv("SUPABASE_SECRET_KEY")
 
-HTTP: httpx.AsyncClient | None = None
-bot: Bot | None = None
-
+HTTP = None
+bot = None
 dp = Dispatcher()
 
 
@@ -91,38 +90,26 @@ CARDS = {
     ],
 }
 
-
 PENALTY = "😈 اگه کارت رو انجام ندی، باید از همه اسپنک بخوری!"
 
 
-def db_headers(prefer: str | None = None) -> dict:
+def db_headers(prefer=None):
     headers = {
         "apikey": SUPABASE_SECRET_KEY,
         "Content-Type": "application/json",
     }
-
     if prefer:
         headers["Prefer"] = prefer
-
     return headers
 
 
-async def db_request(
-    method: str,
-    table: str,
-    *,
-    params: dict | None = None,
-    payload=None,
-    prefer: str | None = None,
-):
+async def db_request(method, table, params=None, payload=None, prefer=None):
     if HTTP is None:
-        raise RuntimeError("اتصال دیتابیس هنوز آماده نشده است.")
-
-    url = f"{SUPABASE_URL}/rest/v1/{table}"
+        raise RuntimeError("اتصال دیتابیس آماده نیست.")
 
     response = await HTTP.request(
         method,
-        url,
+        f"{SUPABASE_URL}/rest/v1/{table}",
         params=params,
         json=payload,
         headers=db_headers(prefer),
@@ -131,7 +118,7 @@ async def db_request(
     if not response.is_success:
         print(
             f"Supabase error [{response.status_code}] "
-            f"on {method} {table}: {response.text}"
+            f"{method} {table}: {response.text}"
         )
         response.raise_for_status()
 
@@ -141,15 +128,15 @@ async def db_request(
     return None
 
 
-def group_only(message: Message) -> bool:
+def group_only(message):
     return message.chat.type in ("group", "supergroup")
 
 
-def safe_name(name: str) -> str:
-    return html.escape(name)
+def safe_name(name):
+    return html.escape(name or "بدون نام")
 
 
-async def players(chat_id: int) -> list[dict]:
+async def players(chat_id):
     rows = await db_request(
         "GET",
         "players",
@@ -169,7 +156,7 @@ async def players(chat_id: int) -> list[dict]:
     ]
 
 
-async def active(chat_id: int) -> bool:
+async def active(chat_id):
     rows = await db_request(
         "GET",
         "games",
@@ -179,32 +166,23 @@ async def active(chat_id: int) -> bool:
             "limit": "1",
         },
     )
-
     return bool(rows and rows[0]["active"])
 
 
-async def set_active(chat_id: int, value: bool) -> None:
-    # ابتدا رکورد موجود را به‌روزرسانی می‌کنیم.
+async def set_active(chat_id, value):
     rows = await db_request(
         "PATCH",
         "games",
-        params={
-            "chat_id": f"eq.{chat_id}",
-        },
-        payload={
-            "active": value,
-        },
+        params={"chat_id": f"eq.{chat_id}"},
+        payload={"active": value},
         prefer="return=representation",
     )
 
-    # اگر رکورد وجود نداشت، آن را ایجاد می‌کنیم.
     if not rows:
         await db_request(
             "POST",
             "games",
-            params={
-                "on_conflict": "chat_id",
-            },
+            params={"on_conflict": "chat_id"},
             payload={
                 "chat_id": chat_id,
                 "active": value,
@@ -212,16 +190,49 @@ async def set_active(chat_id: int, value: bool) -> None:
             prefer="resolution=merge-duplicates,return=representation",
         )
 
-    # نتیجه را از دیتابیس دوباره می‌خوانیم.
-    saved_value = await active(chat_id)
-
-    if saved_value != value:
-        raise RuntimeError(
-            f"Game status was not saved correctly for chat {chat_id}"
-        )
+    if await active(chat_id) != value:
+        raise RuntimeError("ذخیره وضعیت بازی ناموفق بود.")
 
 
-def next_keyboard() -> InlineKeyboardMarkup:
+async def valid_game(chat_id):
+    members = await players(chat_id)
+    return (
+        len(members) == 4
+        and sorted(p["team"] for p in members) == [1, 1, 2, 2]
+    )
+
+
+async def stop_if_incomplete(chat_id):
+    if await active(chat_id) and not await valid_game(chat_id):
+        await set_active(chat_id, False)
+        return True
+    return False
+
+
+async def is_admin(message):
+    if not message.from_user:
+        return False
+
+    member = await bot.get_chat_member(
+        message.chat.id,
+        message.from_user.id,
+    )
+    return member.status in ("administrator", "creator")
+
+
+async def delete_player(chat_id, user_id):
+    await db_request(
+        "DELETE",
+        "players",
+        params={
+            "chat_id": f"eq.{chat_id}",
+            "user_id": f"eq.{user_id}",
+        },
+        prefer="return=minimal",
+    )
+
+
+def next_keyboard():
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -234,19 +245,13 @@ def next_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-async def send_card(chat_id: int) -> None:
-    if bot is None:
-        return
-
+async def send_card(chat_id):
     members = await players(chat_id)
 
-    if (
-        len(members) != 4
-        or sorted(p["team"] for p in members) != [1, 1, 2, 2]
-    ):
+    if not await valid_game(chat_id):
         await bot.send_message(
             chat_id,
-            "برای شروع دقیقاً ۴ نفر و ۲ نفر در هر تیم لازم است.",
+            "برای بازی دقیقاً ۴ نفر و ۲ نفر در هر تیم لازم است.",
         )
         return
 
@@ -255,15 +260,11 @@ async def send_card(chat_id: int) -> None:
 
     if category == "چالش زوجی":
         team_no = random.choice([1, 2])
-
         selected = [
-            p for p in members
-            if p["team"] == team_no
+            p for p in members if p["team"] == team_no
         ]
-
         target = "زوج " + str(team_no) + ": " + " و ".join(
-            safe_name(p["name"])
-            for p in selected
+            safe_name(p["name"]) for p in selected
         )
     else:
         selected = random.choice(members)
@@ -282,15 +283,14 @@ async def send_card(chat_id: int) -> None:
 @dp.message(Command("start"))
 async def start(message: Message):
     if not group_only(message):
-        await message.answer(
-            "این ربات برای گروه چهارنفره طراحی شده است."
-        )
+        await message.answer("این ربات برای گروه چهارنفره طراحی شده است.")
         return
 
     await message.answer(
         "سلام! 🎲\n"
         "برای عضویت /join را بزنید.\n"
-        "برای انتخاب تیم /team 1 یا /team 2\n"
+        "انتخاب تیم: /team 1 یا /team 2\n"
+        "وضعیت: /status\n"
         "راهنما: /help"
     )
 
@@ -301,14 +301,17 @@ async def help_command(message: Message):
         return
 
     await message.answer(
-        "<b>دستورهای بازی</b>\n"
+        "<b>دستورهای بازی</b>\n\n"
         "/join — عضویت\n"
+        "/leave — خروج از بازی\n"
+        "/remove — حذف فرد با ریپلای (فقط مدیر)\n"
         "/team 1 — تیم اول\n"
         "/team 2 — تیم دوم\n"
         "/status — وضعیت بازیکنان\n"
         "/begin — شروع بازی\n"
         "/next — کارت بعدی\n"
-        "/stop — توقف بازی"
+        "/stop — توقف بازی\n"
+        "/reset — پاک‌سازی کامل اعضا (فقط مدیر)"
     )
 
 
@@ -332,12 +335,14 @@ async def join(message: Message):
     )
 
     if existing:
-        await message.answer("قبلاً عضو شدی.")
+        await message.answer(
+            "قبلاً عضو بازی هستی. برای تغییر تیم از /team استفاده کن."
+        )
         return
 
-    current_players = await players(chat_id)
+    current = await players(chat_id)
 
-    if len(current_players) >= 4:
+    if len(current) >= 4:
         await message.answer("ظرفیت بازی تکمیل است.")
         return
 
@@ -353,28 +358,23 @@ async def join(message: Message):
         prefer="return=minimal",
     )
 
+    await stop_if_incomplete(chat_id)
+
     await message.answer(
-        f"✅ {safe_name(user.full_name)} عضو شد. "
+        f"✅ {safe_name(user.full_name)} عضو شد.\n"
         "حالا تیمت را با /team 1 یا /team 2 انتخاب کن."
     )
 
 
-@dp.message(Command("team"))
-async def choose_team(message: Message):
+@dp.message(Command("leave"))
+async def leave(message: Message):
     if not group_only(message) or not message.from_user:
-        return
-
-    parts = (message.text or "").split()
-
-    if len(parts) != 2 or parts[1] not in ("1", "2"):
-        await message.answer("فرمت: /team 1 یا /team 2")
         return
 
     chat_id = message.chat.id
     user_id = message.from_user.id
-    team_no = int(parts[1])
 
-    exists = await db_request(
+    current = await db_request(
         "GET",
         "players",
         params={
@@ -385,8 +385,103 @@ async def choose_team(message: Message):
         },
     )
 
+    if not current:
+        await message.answer("عضو بازی نیستی.")
+        return
+
+    await delete_player(chat_id, user_id)
+    stopped = await stop_if_incomplete(chat_id)
+
+    text = "از بازی خارج شدی. ✅"
+    if stopped:
+        text += "\n⏹ بازی به دلیل تغییر اعضا متوقف شد."
+
+    await message.answer(text)
+
+
+@dp.message(Command("remove"))
+async def remove(message: Message):
+    if not group_only(message):
+        return
+
+    if not await is_admin(message):
+        await message.answer("⛔ فقط مدیر گروه می‌تواند بازیکن حذف کند.")
+        return
+
+    target_id = None
+
+    if message.reply_to_message and message.reply_to_message.from_user:
+        target_id = message.reply_to_message.from_user.id
+    else:
+        parts = (message.text or "").split()
+        if len(parts) == 2 and parts[1].isdigit():
+            target_id = int(parts[1])
+
+    if target_id is None:
+        await message.answer(
+            "برای حذف، روی پیام فرد ریپلای کن و بنویس /remove\n"
+            "یا شناسه عددی او را وارد کن:\n"
+            "/remove USER_ID"
+        )
+        return
+
+    current = await db_request(
+        "GET",
+        "players",
+        params={
+            "select": "user_id,name",
+            "chat_id": f"eq.{message.chat.id}",
+            "user_id": f"eq.{target_id}",
+            "limit": "1",
+        },
+    )
+
+    if not current:
+        await message.answer("این فرد عضو بازی نیست.")
+        return
+
+    await delete_player(message.chat.id, target_id)
+    stopped = await stop_if_incomplete(message.chat.id)
+
+    text = f"🗑 {safe_name(current[0]['name'])} از بازی حذف شد."
+    if stopped:
+        text += "\n⏹ بازی به دلیل تغییر اعضا متوقف شد."
+
+    await message.answer(text)
+
+
+@dp.message(Command("team"))
+async def choose_team(message: Message):
+    if not group_only(message) or not message.from_user:
+        return
+
+    parts = (message.text or "").split()
+
+    if len(parts) != 2 or parts[1] not in ("1", "2"):
+        await message.answer("فرمت صحیح: /team 1 یا /team 2")
+        return
+
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+    team_no = int(parts[1])
+
+    exists = await db_request(
+        "GET",
+        "players",
+        params={
+            "select": "user_id,team",
+            "chat_id": f"eq.{chat_id}",
+            "user_id": f"eq.{user_id}",
+            "limit": "1",
+        },
+    )
+
     if not exists:
         await message.answer("اول /join را بزن.")
+        return
+
+    if exists[0]["team"] == team_no:
+        await message.answer(f"همین الان عضو تیم {team_no} هستی.")
         return
 
     team_members = await db_request(
@@ -401,7 +496,7 @@ async def choose_team(message: Message):
     )
 
     if len(team_members or []) >= 2:
-        await message.answer("این تیم تکمیل است.")
+        await message.answer("این تیم تکمیل است. تیم دیگر را انتخاب کن.")
         return
 
     await db_request(
@@ -411,15 +506,11 @@ async def choose_team(message: Message):
             "chat_id": f"eq.{chat_id}",
             "user_id": f"eq.{user_id}",
         },
-        payload={
-            "team": team_no,
-        },
+        payload={"team": team_no},
         prefer="return=minimal",
     )
 
-    await message.answer(
-        f"تیم {team_no} برایت ثبت شد. ✅"
-    )
+    await message.answer(f"تیم {team_no} برایت ثبت شد. ✅")
 
 
 @dp.message(Command("status"))
@@ -436,7 +527,6 @@ async def status(message: Message):
             for p in members
             if p["team"] == team_no
         ]
-
         lines.append(
             f"تیم {team_no}: " + (", ".join(names) or "—")
         )
@@ -448,12 +538,9 @@ async def status(message: Message):
     ]
 
     if unassigned:
-        lines.append(
-            "بدون تیم: " + ", ".join(unassigned)
-        )
+        lines.append("بدون تیم: " + ", ".join(unassigned))
 
     lines.append(f"تعداد اعضا: {len(members)}/4")
-
     lines.append(
         "وضعیت اجرا: " +
         ("🔥 فعال" if await active(message.chat.id) else "⏹ متوقف")
@@ -468,12 +555,8 @@ async def begin(message: Message):
         return
 
     chat_id = message.chat.id
-    members = await players(chat_id)
 
-    if (
-        len(members) != 4
-        or sorted(p["team"] for p in members) != [1, 1, 2, 2]
-    ):
+    if not await valid_game(chat_id):
         await message.answer(
             "برای شروع، ۴ عضو و ۲ نفر در هر تیم لازم است. /status"
         )
@@ -483,14 +566,10 @@ async def begin(message: Message):
         await set_active(chat_id, True)
     except Exception as error:
         print(f"Could not activate game: {error}")
-        await message.answer(
-            "❌ وضعیت بازی در دیتابیس ثبت نشد. "
-            "لطفاً دوباره تلاش کن."
-        )
+        await message.answer("❌ ذخیره وضعیت بازی ناموفق بود.")
         return
 
     await message.answer("🔥 بازی شروع شد!")
-
     await send_card(chat_id)
 
 
@@ -500,9 +579,7 @@ async def next_command(message: Message):
         return
 
     if not await active(message.chat.id):
-        await message.answer(
-            "بازی فعال نیست. اول /begin را بزن."
-        )
+        await message.answer("بازی فعال نیست. اول /begin را بزن.")
         return
 
     await send_card(message.chat.id)
@@ -514,8 +591,34 @@ async def stop(message: Message):
         return
 
     await set_active(message.chat.id, False)
-
     await message.answer("⏹ بازی متوقف شد.")
+
+
+@dp.message(Command("reset"))
+async def reset(message: Message):
+    if not group_only(message):
+        return
+
+    if not await is_admin(message):
+        await message.answer("⛔ فقط مدیر گروه می‌تواند بازی را پاک‌سازی کند.")
+        return
+
+    chat_id = message.chat.id
+
+    await set_active(chat_id, False)
+
+    await db_request(
+        "DELETE",
+        "players",
+        params={"chat_id": f"eq.{chat_id}"},
+        prefer="return=minimal",
+    )
+
+    await message.answer(
+        "♻️ بازی پاک‌سازی شد.\n"
+        "تمام اعضا حذف شدند و بازی متوقف است.\n"
+        "برای شروع مجدد، همه باید /join بزنند."
+    )
 
 
 @dp.callback_query(F.data == "next_card")
@@ -527,14 +630,10 @@ async def next_button(callback: CallbackQuery):
     chat_id = callback.message.chat.id
 
     if not await active(chat_id):
-        await callback.answer(
-            "بازی فعال نیست.",
-            show_alert=True,
-        )
+        await callback.answer("بازی فعال نیست.", show_alert=True)
         return
 
     await callback.answer()
-
     await send_card(chat_id)
 
 
@@ -565,19 +664,13 @@ async def main():
         await db_request(
             "GET",
             "players",
-            params={
-                "select": "user_id",
-                "limit": "1",
-            },
+            params={"select": "user_id", "limit": "1"},
         )
 
         await db_request(
             "GET",
             "games",
-            params={
-                "select": "chat_id,active",
-                "limit": "1",
-            },
+            params={"select": "chat_id,active", "limit": "1"},
         )
 
         print(
