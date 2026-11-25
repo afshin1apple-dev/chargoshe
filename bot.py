@@ -1,9 +1,9 @@
-
 import asyncio
+import html
 import os
 import random
-import sqlite3
 
+import httpx
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import (
@@ -15,8 +15,12 @@ from aiogram.types import (
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 
+
 TOKEN = os.getenv("BOT_TOKEN")
-DB = sqlite3.connect("game.db", check_same_thread=False)
+SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").rstrip("/")
+SUPABASE_SECRET_KEY = os.getenv("SUPABASE_SECRET_KEY")
+
+HTTP: httpx.AsyncClient | None = None
 
 CARDS = {
     "حقیقت": [
@@ -82,85 +86,117 @@ CARDS = {
     ],
 }
 
-DB.execute("""
-CREATE TABLE IF NOT EXISTS players (
-    chat_id INTEGER,
-    user_id INTEGER,
-    name TEXT,
-    team INTEGER,
-    PRIMARY KEY(chat_id, user_id)
-)
-""")
-DB.execute("""
-CREATE TABLE IF NOT EXISTS games (
-    chat_id INTEGER PRIMARY KEY,
-    active INTEGER DEFAULT 0
-)
-""")
-DB.commit()
 
-bot = Bot(
-    TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
-)
-dp = Dispatcher()
+def db_headers(prefer: str | None = None) -> dict:
+    # کلیدهای جدید sb_secret_* باید فقط در هدر apikey ارسال شوند؛
+    # این کلیدها JWT نیستند و نباید در Authorization: Bearer قرار بگیرند.
+    headers = {
+        "apikey": SUPABASE_SECRET_KEY,
+        "Content-Type": "application/json",
+    }
+    if prefer:
+        headers["Prefer"] = prefer
+    return headers
 
 
-def group_only(message):
+async def db_request(
+    method: str,
+    table: str,
+    *,
+    params: dict | None = None,
+    payload=None,
+    prefer: str | None = None,
+):
+    if HTTP is None:
+        raise RuntimeError("اتصال دیتابیس هنوز آماده نشده است.")
+
+    url = f"{SUPABASE_URL}/rest/v1/{table}"
+    response = await HTTP.request(
+        method,
+        url,
+        params=params,
+        json=payload,
+        headers=db_headers(prefer),
+    )
+
+    if not response.is_success:
+        # جزئیات فنی در لاگ GitHub ثبت می‌شود؛ به کاربران نمایش داده نمی‌شود.
+        print(
+            f"Supabase error [{response.status_code}] "
+            f"on {method} {table}: {response.text}"
+        )
+        response.raise_for_status()
+
+    if response.content:
+        return response.json()
+    return None
+
+
+def group_only(message: Message) -> bool:
     return message.chat.type in ("group", "supergroup")
 
 
-def players(chat_id):
-    rows = DB.execute(
-        "SELECT user_id, name, team FROM players WHERE chat_id=?",
-        (chat_id,)
-    ).fetchall()
+async def players(chat_id: int) -> list[dict]:
+    rows = await db_request(
+        "GET",
+        "players",
+        params={
+            "select": "user_id,name,team",
+            "chat_id": f"eq.{chat_id}",
+        },
+    )
     return [
-        {"id": r[0], "name": r[1], "team": r[2]}
-        for r in rows
+        {
+            "id": int(row["user_id"]),
+            "name": row["name"],
+            "team": row["team"],
+        }
+        for row in (rows or [])
     ]
 
 
-def active(chat_id):
-    row = DB.execute(
-        "SELECT active FROM games WHERE chat_id=?",
-        (chat_id,)
-    ).fetchone()
-    return bool(row and row[0])
-
-
-def set_active(chat_id, value):
-    DB.execute(
-        "INSERT INTO games(chat_id, active) VALUES(?, ?) "
-        "ON CONFLICT(chat_id) DO UPDATE SET active=excluded.active",
-        (chat_id, int(value))
+async def active(chat_id: int) -> bool:
+    rows = await db_request(
+        "GET",
+        "games",
+        params={
+            "select": "active",
+            "chat_id": f"eq.{chat_id}",
+            "limit": "1",
+        },
     )
-    DB.commit()
+    return bool(rows and rows[0]["active"])
 
 
-def safe_name(name):
-    return (
-        name.replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
+async def set_active(chat_id: int, value: bool) -> None:
+    await db_request(
+        "POST",
+        "games",
+        params={"on_conflict": "chat_id"},
+        payload={"chat_id": chat_id, "active": value},
+        prefer="resolution=merge-duplicates,return=minimal",
     )
 
 
-def next_keyboard():
+def safe_name(name: str) -> str:
+    return html.escape(name)
+
+
+def next_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
                     text="🎲 کارت بعدی",
-                    callback_data="next_card"
+                    callback_data="next_card",
                 )
             ]
         ]
     )
 
 
-async def send_card(chat_id):
-    members = players(chat_id)
+async def send_card(chat_id: int) -> None:
+    members = await players(chat_id)
 
     if (
         len(members) != 4
@@ -168,7 +204,7 @@ async def send_card(chat_id):
     ):
         await bot.send_message(
             chat_id,
-            "برای شروع دقیقاً ۴ نفر و ۲ نفر در هر تیم لازم است."
+            "برای شروع دقیقاً ۴ نفر و ۲ نفر در هر تیم لازم است.",
         )
         return
 
@@ -177,9 +213,7 @@ async def send_card(chat_id):
 
     if category == "چالش زوجی":
         team_no = random.choice([1, 2])
-        selected = [
-            p for p in members if p["team"] == team_no
-        ]
+        selected = [p for p in members if p["team"] == team_no]
         target = "زوج " + str(team_no) + ": " + " و ".join(
             safe_name(p["name"]) for p in selected
         )
@@ -191,11 +225,15 @@ async def send_card(chat_id):
         chat_id,
         f"🎯 <b>{category}</b>\n"
         f"👤 نوبت: <b>{target}</b>\n\n"
-        f"🃏 {card}\n\n"
+        f"🃏 {html.escape(card)}\n\n"
         "🩵 اجرای کارت فقط با رضایت افراد است؛ "
         "هرکس می‌تواند کارت را رد کند.",
-        reply_markup=next_keyboard()
+        reply_markup=next_keyboard(),
     )
+
+
+bot: Bot | None = None
+dp = Dispatcher()
 
 
 @dp.message(Command("start"))
@@ -239,29 +277,37 @@ async def join(message: Message):
     chat_id = message.chat.id
     user = message.from_user
 
-    exists = DB.execute(
-        "SELECT 1 FROM players WHERE chat_id=? AND user_id=?",
-        (chat_id, user.id)
-    ).fetchone()
+    existing = await db_request(
+        "GET",
+        "players",
+        params={
+            "select": "user_id",
+            "chat_id": f"eq.{chat_id}",
+            "user_id": f"eq.{user.id}",
+            "limit": "1",
+        },
+    )
 
-    if exists:
+    if existing:
         await message.answer("قبلاً عضو شدی.")
         return
 
-    count = DB.execute(
-        "SELECT COUNT(*) FROM players WHERE chat_id=?",
-        (chat_id,)
-    ).fetchone()[0]
-
-    if count >= 4:
+    current_players = await players(chat_id)
+    if len(current_players) >= 4:
         await message.answer("ظرفیت بازی تکمیل است.")
         return
 
-    DB.execute(
-        "INSERT INTO players VALUES(?, ?, ?, NULL)",
-        (chat_id, user.id, user.full_name)
+    await db_request(
+        "POST",
+        "players",
+        payload={
+            "chat_id": chat_id,
+            "user_id": user.id,
+            "name": user.full_name,
+            "team": None,
+        },
+        prefer="return=minimal",
     )
-    DB.commit()
 
     await message.answer(
         f"✅ {safe_name(user.full_name)} عضو شد. "
@@ -284,30 +330,46 @@ async def choose_team(message: Message):
     user_id = message.from_user.id
     team_no = int(parts[1])
 
-    exists = DB.execute(
-        "SELECT 1 FROM players WHERE chat_id=? AND user_id=?",
-        (chat_id, user_id)
-    ).fetchone()
+    exists = await db_request(
+        "GET",
+        "players",
+        params={
+            "select": "user_id",
+            "chat_id": f"eq.{chat_id}",
+            "user_id": f"eq.{user_id}",
+            "limit": "1",
+        },
+    )
 
     if not exists:
         await message.answer("اول /join را بزن.")
         return
 
-    count = DB.execute(
-        "SELECT COUNT(*) FROM players "
-        "WHERE chat_id=? AND team=? AND user_id<>?",
-        (chat_id, team_no, user_id)
-    ).fetchone()[0]
+    team_members = await db_request(
+        "GET",
+        "players",
+        params={
+            "select": "user_id",
+            "chat_id": f"eq.{chat_id}",
+            "team": f"eq.{team_no}",
+            "user_id": f"neq.{user_id}",
+        },
+    )
 
-    if count >= 2:
+    if len(team_members or []) >= 2:
         await message.answer("این تیم تکمیل است.")
         return
 
-    DB.execute(
-        "UPDATE players SET team=? WHERE chat_id=? AND user_id=?",
-        (team_no, chat_id, user_id)
+    await db_request(
+        "PATCH",
+        "players",
+        params={
+            "chat_id": f"eq.{chat_id}",
+            "user_id": f"eq.{user_id}",
+        },
+        payload={"team": team_no},
+        prefer="return=minimal",
     )
-    DB.commit()
 
     await message.answer(f"تیم {team_no} برایت ثبت شد. ✅")
 
@@ -317,13 +379,14 @@ async def status(message: Message):
     if not group_only(message):
         return
 
-    members = players(message.chat.id)
+    members = await players(message.chat.id)
     lines = ["<b>وضعیت بازی</b>"]
 
     for team_no in (1, 2):
         names = [
             safe_name(p["name"])
-            for p in members if p["team"] == team_no
+            for p in members
+            if p["team"] == team_no
         ]
         lines.append(
             f"تیم {team_no}: " + (", ".join(names) or "—")
@@ -331,7 +394,8 @@ async def status(message: Message):
 
     unassigned = [
         safe_name(p["name"])
-        for p in members if p["team"] is None
+        for p in members
+        if p["team"] is None
     ]
 
     if unassigned:
@@ -346,7 +410,7 @@ async def begin(message: Message):
     if not group_only(message):
         return
 
-    members = players(message.chat.id)
+    members = await players(message.chat.id)
 
     if (
         len(members) != 4
@@ -357,7 +421,7 @@ async def begin(message: Message):
         )
         return
 
-    set_active(message.chat.id, True)
+    await set_active(message.chat.id, True)
     await message.answer("🔥 بازی شروع شد!")
     await send_card(message.chat.id)
 
@@ -367,7 +431,7 @@ async def next_command(message: Message):
     if not group_only(message):
         return
 
-    if not active(message.chat.id):
+    if not await active(message.chat.id):
         await message.answer("بازی فعال نیست. اول /begin را بزن.")
         return
 
@@ -379,7 +443,7 @@ async def stop(message: Message):
     if not group_only(message):
         return
 
-    set_active(message.chat.id, False)
+    await set_active(message.chat.id, False)
     await message.answer("⏹ بازی متوقف شد.")
 
 
@@ -391,10 +455,10 @@ async def next_button(callback: CallbackQuery):
 
     chat_id = callback.message.chat.id
 
-    if not active(chat_id):
+    if not await active(chat_id):
         await callback.answer(
             "بازی فعال نیست.",
-            show_alert=True
+            show_alert=True,
         )
         return
 
@@ -403,10 +467,38 @@ async def next_button(callback: CallbackQuery):
 
 
 async def main():
+    global HTTP, bot
+
     if not TOKEN:
         raise RuntimeError("BOT_TOKEN تنظیم نشده است.")
+    if not SUPABASE_URL:
+        raise RuntimeError("SUPABASE_URL تنظیم نشده است.")
+    if not SUPABASE_SECRET_KEY:
+        raise RuntimeError("SUPABASE_SECRET_KEY تنظیم نشده است.")
 
-    await dp.start_polling(bot)
+    bot = Bot(
+        TOKEN,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    )
+    HTTP = httpx.AsyncClient(timeout=httpx.Timeout(20.0))
+
+    try:
+        # بررسی اتصال و دسترسی به جدول‌ها پیش از شروع دریافت پیام‌ها
+        await db_request(
+            "GET",
+            "players",
+            params={"select": "user_id", "limit": "1"},
+        )
+        await db_request(
+            "GET",
+            "games",
+            params={"select": "chat_id", "limit": "1"},
+        )
+        print("Supabase connection OK. Telegram bot is starting.")
+        await dp.start_polling(bot)
+    finally:
+        await HTTP.aclose()
+        await bot.session.close()
 
 
 if __name__ == "__main__":
